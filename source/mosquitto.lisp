@@ -1,42 +1,19 @@
 (in-package :hu.dwim.mosquitto)
 
 ;;;;;;
-;;; library loading
-
-;; TODO do we need an asdf:register-image-restore-hook ?
-
-;; TODO FIXME delme
-(setf cffi:*foreign-library-directories* '("/home/alendvai/workspace/mosquitto/lib/"))
-
-(cffi:define-foreign-library libmosquitto
-  (t (:or "libmosquitto" "libmosquitto.so" "libmosquitto.so.1")))
-
-(cffi:use-foreign-library libmosquitto)
-
-;;;;;;
-;;; types
-
-;;;;;;
-;;; utils
-
-(defmacro c-fun/not-null (&whole whole fn-name &rest args)
-  (with-unique-names (rc)
-    `(let ((,rc (c-fun ,fn-name ,@args)))
-       (when (null ,rc)
-         (error "FFI call unexpectedly returned null. Name: ~S, expression: ~S." ',fn-name ',whole))
-       ,rc)))
-
-;;;;;;
 ;;; conditions
 
 (define-condition mosquitto-error (simple-condition error)
-  ((error-code )))
+  (#+nil
+   (error-code :initform nil
+               :initarg :error-code
+               :accessor error-code-of)))
 
 (defun mosquitto-error (datum &rest args)
   (error 'mosquitto-error :format-control datum :format-arguments args))
 
 (defun mosquitto-error* (error-code datum &rest args)
-  (apply 'mosquitto-error (concatenate 'string datum (format nil "error code: ~S, ~S." error-code (hu.dwim.mosquitto.ffi:strerror error-code)))
+  (apply 'mosquitto-error (concatenate 'string datum (format nil "error code: ~S, ~S." error-code (|strerror| error-code)))
          args))
 
 ;;;;;;
@@ -54,7 +31,7 @@
      (unwind-protect
           (progn
             ,@body)
-       (destroy (the (not null) *session*)))))
+       (|destroy| (the (not null) *session*)))))
 
 (defmacro with-session (session &body body)
   `(let ((*session* ,session))
@@ -65,25 +42,28 @@
 
 (defun %ensure-callback-values (session log-callback connect-callback message-callback subscribe-callback)
   (check-type session (not null))
+  ;; TODO there are other callbacks, are they interesting?
   (when log-callback
-    (hu.dwim.mosquitto.ffi:log-callback-set session log-callback))
+    (|log_callback_set| session log-callback))
   (when connect-callback
-    (hu.dwim.mosquitto.ffi:connect-callback-set session connect-callback))
+    (|connect_callback_set| session connect-callback))
   (when message-callback
-    (hu.dwim.mosquitto.ffi:message-callback-set session message-callback))
+    (|message_callback_set| session message-callback))
   (when subscribe-callback
-    (hu.dwim.mosquitto.ffi:subscribe-callback-set session subscribe-callback)))
+    (|subscribe_callback_set| session subscribe-callback)))
 
 (defun lib-version ()
-  (c-let ((major :int)
-          (minor :int)
-          (revision :int))
-    (hu.dwim.mosquitto.ffi:lib-version (major &) (minor &) (revision &))
-    (values major minor revision)))
+  (with-foreign-objects ((major :int)
+                         (minor :int)
+                         (revision :int))
+    (|lib_version| major minor revision)
+    (values (mem-ref major :int)
+            (mem-ref minor :int)
+            (mem-ref revision :int))))
 
 (defun lib-init (&key minimum-version)
   (check-type minimum-version list)
-  (hu.dwim.mosquitto.ffi:lib-init)
+  (|lib_init|)
   (when minimum-version
     (destructuring-bind
           (e-major &optional e-minor e-revision)
@@ -104,6 +84,9 @@
                         (>= revision e-revision))))))))
   (values))
 
+(defun lib-cleanup ()
+  (|lib_cleanup|))
+
 (defun %set-tls-parameters (session tls-certificate-authority tls-client-certificate tls-private-key password-callback)
   (check-type tls-certificate-authority (or null pathname))
   (check-type tls-client-certificate (or null pathname))
@@ -114,24 +97,26 @@
         (if (uiop:directory-pathname-p tls-certificate-authority)
             (values (namestring tls-certificate-authority) nil)
             (values nil (namestring tls-certificate-authority))))
-    (let ((result (c-fun hu.dwim.mosquitto.ffi:tls-set
-                         session
-                         ca-file
-                         (or ca-path (cffi:null-pointer)) ;; TODO FIXME clarify with oGMo about autowrap
-                         (when tls-client-certificate
-                           (namestring tls-client-certificate))
-                         (when tls-private-key
-                           (namestring tls-private-key))
-                         password-callback)))
+    (let ((result (|tls_set| session
+                             ca-file
+                             (or ca-path (cffi:null-pointer))
+                             (if tls-client-certificate
+                                 (namestring tls-client-certificate)
+                                 (cffi:null-pointer))
+                             (if tls-private-key
+                                 (namestring tls-private-key)
+                                 (cffi:null-pointer))
+                             (or password-callback (cffi:null-pointer)))))
       (unless (zerop result)
-        (mosquitto-error* result "Error from Mosquitto tls-set FFI call, "))))
+        (mosquitto-error* result "Error from Mosquitto 'tls_set' FFI call, "))))
   (values))
 
 (defun new-session (&key client-id (clean-session? t) user-object
                       log-callback connect-callback message-callback subscribe-callback
                       ;; TLS related args
                       tls-certificate-authority tls-client-certificate tls-private-key password-callback)
-  (let ((session (c-fun/not-null hu.dwim.mosquitto.ffi:new client-id clean-session? user-object)))
+  (let ((session (the (not null)
+                   (|new| client-id clean-session? (or user-object (cffi:null-pointer))))))
     (%ensure-callback-values session log-callback connect-callback message-callback subscribe-callback)
     (%set-tls-parameters session tls-certificate-authority tls-client-certificate tls-private-key password-callback)
     session))
@@ -141,13 +126,13 @@
   (check-type host string)
   (check-type keepalive-interval positive-integer)
   (check-type port (unsigned-byte 16))
-  (let ((result (hu.dwim.mosquitto.ffi:connect (current-session) host port keepalive-interval)))
+  (let ((result (|connect| (current-session) host port keepalive-interval)))
     (unless (eql result 0)
       (mosquitto-error* result "Error from Mosquitto connect FFI call. Host: ~S, port: ~S, " host port)))
   (values))
 
 (defun process-some-events (&key (timeout 0) (count 1))
-  (let ((result (hu.dwim.mosquitto.ffi:loop (current-session) timeout count)))
+  (let ((result (|loop| (current-session) timeout count)))
     (unless (zerop result)
       (mosquitto-error* result "Error from Mosquitto loop FFI call, "))
     t))
@@ -156,16 +141,15 @@
   (check-type topic string)
   (check-type payload (vector (unsigned-byte 8)))
   (check-type qos (integer 0 3))
-  (c-let ((message-id :int))
-    (cffi:with-pointer-to-vector-data (payload-pointer payload)
-      (let ((result (c-fun hu.dwim.mosquitto.ffi:publish
-                           (current-session)
-                           (message-id &)
-                           topic
-                           (length payload)
-                           payload-pointer
-                           qos
-                           (not (null retain?)))))
+  (with-foreign-object (message-id :int)
+    (with-pointer-to-vector-data (payload-pointer payload)
+      (let ((result (|publish| (current-session)
+                               message-id
+                               topic
+                               (length payload)
+                               payload-pointer
+                               qos
+                               (not (null retain?)))))
         (unless (eql result 0)
           (mosquitto-error* result "Error from Mosquitto publish FFI call. Payload length: ~S, " (length payload)))))
     message-id))
